@@ -1,0 +1,39 @@
+name: build-tweak
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app || true
+
+      - name: Install build deps
+        run: brew install ldid dpkg xz 2>/dev/null || true
+
+      - name: Install Theos
+        run: git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
+
+      - name: Build rootless deb
+        run: |
+          export THEOS="$HOME/theos"
+          export PATH="$THEOS/bin:$PATH"
+          make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          ls -la packages 2>/dev/null || true
+          cp packages/*.deb out/ 2>/dev/null || true
+          cp *.deb out/ 2>/dev/null || true
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: biaoji-keyboard-fix-deb
+          path: out/*.deb
