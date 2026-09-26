@@ -125,15 +125,27 @@ static void S3FixSetText(UIView *field, NSString *text) {
     // 通知 delegate，保证插件的实时预览 / 确认按钮逻辑正常
     if ([field isKindOfClass:[UITextView class]]) {
         UITextView *tv = (UITextView *)field;
-        id<UITextViewDelegate> d = tv.delegate;
+        id d = tv.delegate;
         if (d && [d respondsToSelector:@selector(textViewDidChange:)]) {
             [d textViewDidChange:tv];
         }
     } else if ([field isKindOfClass:[UITextField class]]) {
         UITextField *tf = (UITextField *)field;
-        id<UITextFieldDelegate> d = tf.delegate;
-        if (d && [d respondsToSelector:@selector(textFieldDidChange:)]) {
-            [d textFieldDidChange:tf];
+        id d = tf.delegate;
+        // UITextField 没有标准的「内容变化」delegate 方法，这里用运行时调用，
+        // 兼容插件可能实现的任意命名（textFieldDidChange: / controlTextDidChange: 等）。
+        NSArray<NSString *> *names = @[@"textFieldDidChange:",
+                                       @"controlTextDidChange:",
+                                       @"textDidChange:"];
+        for (NSString *n in names) {
+            SEL s = NSSelectorFromString(n);
+            if (s && [d respondsToSelector:s]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                [d performSelector:s withObject:tf];
+#pragma clang diagnostic pop
+                break;
+            }
         }
     }
 }
