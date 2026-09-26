@@ -1,22 +1,30 @@
 //
 //  S3TextKeyboardFix.m
 //
-//  修复「截图标记」(cn.llld.biaoji, biaoji.dylib) 在 Snapper3 / StayShot 里
+//  修复「截图标记」(cn.llld.biaoji / biaoji.dylib) 在 Snapper3 / StayShot 里
 //  「点文字工具后弹不出键盘、无法打字」的问题。
 //
-//  原实现的 -[S3TextEditViewController ensureTextKeyboard] 只做了两件事：
-//    1) 如果 self.view.window 不是 keyWindow 就 makeKeyWindow
-//    2) dispatch_async 到主队列，取 viewWithTag:200 的 UITextView 后 becomeFirstResponder
-//  在 iOS 15/16 的 SpringBoard 里这条路会静默失效（window 没有 windowScene /
-//  makeKeyWindow 不生效 / 键盘窗口层级低于标注窗口），于是键盘永远不出来。
+//  ── 真实根因（2026-09-26 从设备日志确认） ─────────────────────────────
+//  插件在 SpringBoard 里自建了一个 window 承载标注界面：
+//      win = [[UIWindow alloc] initWithWindowScene:scene]    // scene 取自 connectedScenes
+//      win.windowLevel = UIWindowLevelStatusBar + 1          // 1001
+//  但在 SpringBoard 里，connnectedScenes 枚举出来的第一个可用 scene 是
+//      SBSystemApertureWindowScene (role: SBWindowSceneSessionRoleSystemAperture)
+//  也就是「灵动岛」那个场景 —— 它**不是 App 场景**。
+//  系统键盘窗口 (UIRemoteKeyboardWindow) 只在 UIWindowSceneSessionRoleApplication
+//  下才会被创建。在 SystemAperture 场景里：
+//      - becomeFirstResponder 返回 YES（假成功）
+//      - 输入框光标会闪
+//      - UIKeyboardWillShowNotification 也会发
+//      - 但键盘窗口永远不会被建出来 → 视觉上「键盘不出来」
+//  所以任何「补 scene / 抬 windowLevel / 重试第一响应者」的修法都不可能生效。
 //
-//  本补丁把 ensureTextKeyboard 换成「原实现 + 增强」：
-//    a. 兜底找 window（view.window 为空时遍历 UIApplication.windows）
-//    b. window 没有 windowScene 时补绑当前 active 的 UIWindowScene
-//    c. 强制 makeKeyAndVisible
-//    d. 多次重试 becomeFirstResponder
-//    e. 键盘弹出后把键盘窗口层级抬到标注窗口之上（否则键盘被透明的高层窗口吃掉触摸）
-//    f. 若 2.5s 内键盘仍未出现，启用「独立输入窗口」兜底，把输入同步回真实 textView
+//  ── 修法 ────────────────────────────────────────────────────────────
+//  既然系统键盘在这个场景下不可能出现，就**自绘一个键盘**。
+//  S3TextKeyboardFix 在标注窗口之上再叠一个独立 window(level = base + 2)，
+//  里面放一个自绘键盘视图（字母 / 数字 / 符号 / 拼音候选行 / 空格 / 退格 / 回车），
+//  点击按键时把字符写进原插件 tag=200 的输入框，并触发它的 delegate 回调，
+//  保证「取消 / 确认」按钮和实时预览都照常工作。
 //
 //  日志：/var/mobile/Documents/S3TextKeyboardFix.log
 //
@@ -40,343 +48,441 @@ static void S3FixLog(NSString *fmt, ...) {
     NSString *line = [msg stringByAppendingString:@"\n"];
     NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
     NSFileManager *fm = [NSFileManager defaultManager];
-
     NSString *dir = [S3FixLogPath stringByDeletingLastPathComponent];
     if (![fm fileExistsAtPath:dir]) {
         [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     }
-
     if (![fm fileExistsAtPath:S3FixLogPath]) {
         [data writeToFile:S3FixLogPath atomically:YES];
     } else {
-        NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:S3FixLogPath];
-        if (handle) {
-            [handle seekToEndOfFile];
-            [handle writeData:data];
-            [handle closeFile];
-        }
+        NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:S3FixLogPath];
+        if (h) { [h seekToEndOfFile]; [h writeData:data]; [h closeFile]; }
     }
 }
 
 #pragma mark - 状态
 
 static BOOL S3FixInstalled = NO;
-static BOOL S3FixKeyboardDidShow = NO;   // 最近一次是否真的弹出了键盘
-static BOOL S3FixFallbackActive = NO;    // 兜底输入窗口是否已启用
-static CGFloat S3FixBaseLevel = 0.0;     // 标注窗口的 windowLevel
+static CGFloat S3FixBaseLevel = 0.0;
 static void (*S3FixOrigEnsure)(id, SEL) = NULL;
 
-static UIWindow *S3FixHelperWindow = nil;
-static UITextView *S3FixHelperField = nil;
-static __weak UIView *S3FixRealField = nil;
-static NSTimer *S3FixWatchTimer = nil;
+@class S3FixKeyboardView_i;
 
-#pragma mark - 工具
+static UIWindow *S3FixKbWindow = nil;
+static S3FixKeyboardView_i *S3FixKbView = nil;
+static __weak UIView *S3FixTargetField = nil;
+static UIViewController *S3FixOwnerVC = nil;
 
-static UIWindowScene *S3FixActiveScene(void) {
-    UIApplication *app = [UIApplication sharedApplication];
-    if (![app respondsToSelector:@selector(connectedScenes)]) return nil;
+#pragma mark - 找输入框 / 窗口
 
-    UIWindowScene *fallback = nil;
-    for (UIScene *scene in app.connectedScenes) {
-        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-        if (scene.activationState == UISceneActivationStateForegroundActive) {
-            return (UIWindowScene *)scene;
-        }
-        if (!fallback) fallback = (UIWindowScene *)scene;
+static UIView *S3FixFindTextField(UIView *root) {
+    if (!root) return nil;
+
+    // 插件自己的输入框 tag = 200
+    UIView *byTag = [root viewWithTag:200];
+    if (byTag && [byTag respondsToSelector:@selector(setText:)]) return byTag;
+
+    // 兜底：深度优先找第一个可编辑的 UITextView / UITextField
+    for (UIView *sub in root.subviews) {
+        UIView *r = S3FixFindTextField(sub);
+        if (r) return r;
     }
-    return fallback;
+    if ([root isKindOfClass:[UITextView class]] ||
+        [root isKindOfClass:[UITextField class]]) {
+        return root;
+    }
+    return nil;
 }
 
 static UIWindow *S3FixWindowForView(UIView *view) {
     if (!view) return nil;
     if (view.window) return view.window;
-
     for (UIWindow *w in [UIApplication sharedApplication].windows) {
         if ([view isDescendantOfView:w]) return w;
     }
     return nil;
 }
 
-// 键盘窗口（UITextEffectsWindow / UIRemoteKeyboardWindow 等）层级低于标注窗口时，
-// 键盘虽然"存在"但会被高层透明窗口吃掉触摸 —— 看起来就像没弹出来。
-static void S3FixRaiseKeyboardWindow(CGFloat minLevel) {
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        NSString *cls = NSStringFromClass([w class]);
-        BOOL isKeyboard = [cls rangeOfString:@"TextEffects"].location != NSNotFound ||
-                          [cls rangeOfString:@"RemoteKeyboard"].location != NSNotFound;
-        if (!isKeyboard) continue;
-
-        if (w.windowLevel < minLevel) {
-            S3FixLog(@"raise keyboard window %@ : %.0f -> %.0f", cls, w.windowLevel, minLevel);
-            w.windowLevel = minLevel;
-        }
-    }
+static NSString *S3FixTextOf(UIView *field) {
+    if ([field isKindOfClass:[UITextView class]]) return ((UITextView *)field).text ?: @"";
+    if ([field isKindOfClass:[UITextField class]]) return ((UITextField *)field).text ?: @"";
+    return @"";
 }
 
-static UIView *S3FixTextFieldIn(UIViewController *vc) {
-    UIView *v = [vc.view viewWithTag:200];
-    if (!v) return nil;
-    if (![v respondsToSelector:@selector(becomeFirstResponder)]) return nil;
-    return v;
-}
-
-static void S3FixTryBecomeFirstResponder(UIViewController *vc) {
-    UIView *field = S3FixTextFieldIn(vc);
-    if (!field) {
-        S3FixLog(@"tag 200 text view not found");
-        return;
-    }
-    if ([field isFirstResponder]) return;
-
-    if (![field canBecomeFirstResponder]) {
-        S3FixLog(@"text view canBecomeFirstResponder = NO");
-        return;
-    }
-    BOOL ok = [field becomeFirstResponder];
-    S3FixLog(@"becomeFirstResponder -> %d (window=%@ key=%d)",
-             ok, field.window, field.window.isKeyWindow);
-}
-
-#pragma mark - 兜底：独立输入窗口
-
-@interface S3FixInputSink : NSObject <UITextViewDelegate>
-@property (nonatomic, weak) UIView *target;
-@end
-
-@implementation S3FixInputSink
-- (void)textViewDidChange:(UITextView *)textView {
-    UIView *t = self.target;
-    if (!t) return;
-    if ([t isKindOfClass:[UITextView class]]) {
-        UITextView *tv = (UITextView *)t;
-        if (![tv.text isEqualToString:textView.text]) {
-            tv.text = textView.text;
-            [tv setNeedsDisplay];
-        }
-    } else if ([t respondsToSelector:@selector(setText:)]) {
+static void S3FixSetText(UIView *field, NSString *text) {
+    if ([field isKindOfClass:[UITextView class]]) {
+        ((UITextView *)field).text = text;
+    } else if ([field isKindOfClass:[UITextField class]]) {
+        ((UITextField *)field).text = text;
+    } else if ([field respondsToSelector:@selector(setText:)]) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        [t performSelector:@selector(setText:) withObject:textView.text];
+        [field performSelector:@selector(setText:) withObject:text];
 #pragma clang diagnostic pop
-        [t setNeedsDisplay];
+    }
+    [field setNeedsDisplay];
+
+    // 通知 delegate，保证插件的实时预览 / 确认按钮逻辑正常
+    if ([field isKindOfClass:[UITextView class]]) {
+        UITextView *tv = (UITextView *)field;
+        id<UITextViewDelegate> d = tv.delegate;
+        if (d && [d respondsToSelector:@selector(textViewDidChange:)]) {
+            [d textViewDidChange:tv];
+        }
+    } else if ([field isKindOfClass:[UITextField class]]) {
+        UITextField *tf = (UITextField *)field;
+        id<UITextFieldDelegate> d = tf.delegate;
+        if (d && [d respondsToSelector:@selector(textFieldDidChange:)]) {
+            [d textFieldDidChange:tf];
+        }
     }
 }
+
+#pragma mark - 自绘键盘
+
+@interface S3FixKeyboardView_i : UIView
+@property (nonatomic, weak) UIView *target;
+@property (nonatomic, assign) BOOL shifted;
+@property (nonatomic, assign) BOOL numeric;
+@property (nonatomic, copy)   NSString *composing;   // 拼音缓冲
+@property (nonatomic, strong) UILabel *candidateLabel;
+@property (nonatomic, strong) NSMutableArray<UIButton *> *letterKeys;
 @end
 
-static S3FixInputSink *S3FixSink = nil;
+static NSString * const kRow1 = @"QWERTYUIOP";
+static NSString * const kRow2 = @"ASDFGHJKL";
+static NSString * const kRow3 = @"ZXCVBNM";
 
-static void S3FixStopFallback(void) {
-    if (!S3FixFallbackActive) return;
-    S3FixFallbackActive = NO;
+@implementation S3FixKeyboardView_i
 
-    [S3FixWatchTimer invalidate];
-    S3FixWatchTimer = nil;
-
-    if (S3FixHelperWindow) {
-        S3FixHelperWindow.hidden = YES;
-        S3FixHelperWindow.rootViewController = nil;
-        S3FixHelperWindow = nil;
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        _letterKeys = [NSMutableArray array];
+        _composing = @"";
+        self.backgroundColor = [UIColor colorWithWhite:0.13 alpha:1.0];
+        [self build];
     }
-    S3FixHelperField = nil;
-    S3FixLog(@"fallback stopped");
+    return self;
 }
 
-// 真实输入框所在场景/窗口始终无法承载键盘时的最后手段：
-// 建一个带 scene 的极小窗口，让它的 textView 成为第一响应者，再把输入同步回去。
-static void S3FixStartFallback(UIViewController *vc) {
-    if (S3FixFallbackActive) return;
+#pragma mark 构建
 
-    UIView *realField = S3FixTextFieldIn(vc);
-    if (!realField) return;
+- (UIButton *)keyWithTitle:(NSString *)title action:(SEL)action flex:(CGFloat)flex {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    [b setTitle:title forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont systemFontOfSize:19 weight:UIFontWeightRegular];
+    b.backgroundColor = [UIColor colorWithWhite:0.32 alpha:1.0];
+    b.layer.cornerRadius = 5.0;
+    b.layer.masksToBounds = YES;
+    b.tag = (NSInteger)(flex * 100);
+    [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:b];
+    return b;
+}
 
-    NSString *initialText = @"";
-    UIFont *initialFont = [UIFont systemFontOfSize:16];
-    if ([realField isKindOfClass:[UITextView class]]) {
-        UITextView *tv = (UITextView *)realField;
-        initialText = tv.text ?: @"";
-        initialFont = tv.font ?: initialFont;
+- (void)build {
+    CGFloat W = self.bounds.size.width;
+    CGFloat H = self.bounds.size.height;
+    if (W < 10 || H < 10) return;
+
+    CGFloat pad = 3.0;
+    CGFloat topH = 34.0;                       // 候选行
+    CGFloat rowH = (H - topH - pad * 5) / 4.0; // 4 行
+
+    // 候选 / 提示行
+    self.candidateLabel = [[UILabel alloc] init];
+    self.candidateLabel.font = [UIFont systemFontOfSize:16];
+    self.candidateLabel.textColor = [UIColor whiteColor];
+    self.candidateLabel.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1.0];
+    self.candidateLabel.textAlignment = NSTextAlignmentLeft;
+    self.candidateLabel.text = @"  英文直接输入，⇧ 切换大小写";
+    self.candidateLabel.frame = CGRectMake(pad, pad, W - pad * 2 - 84, topH - pad * 2);
+    self.candidateLabel.layer.cornerRadius = 4;
+    self.candidateLabel.layer.masksToBounds = YES;
+    [self addSubview:self.candidateLabel];
+
+    [self buildLetterRowsWithTop:pad + topH rowH:rowH pad:pad W:W];
+
+    // 第 4 行：大小写 / 123 / 空格 / 退格 / 换行
+    CGFloat y = pad + topH + rowH * 3;
+    CGFloat funcW = W * 0.14;
+
+    UIButton *shift = [UIButton buttonWithType:UIButtonTypeCustom];
+    shift.tag = 778;
+    [shift setTitle:@"⇧" forState:UIControlStateNormal];
+    [shift setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    shift.titleLabel.font = [UIFont systemFontOfSize:19];
+    shift.backgroundColor = [UIColor colorWithWhite:0.32 alpha:1.0];
+    shift.layer.cornerRadius = 5.0;
+    shift.layer.masksToBounds = YES;
+    shift.frame = CGRectMake(pad, y, funcW * 0.8, rowH - pad);
+    [shift addTarget:self action:@selector(shiftTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:shift];
+
+    UIButton *num = [self keyWithTitle:@"123" action:@selector(numTapped) flex:1];
+    num.frame = CGRectMake(CGRectGetMaxX(shift.frame) + pad, y, funcW, rowH - pad);
+
+    UIButton *space = [self keyWithTitle:@"空格" action:@selector(spaceTapped) flex:1];
+    space.frame = CGRectMake(CGRectGetMaxX(num.frame) + pad, y,
+                             W - funcW * 2 - funcW * 0.8 - pad * 5, rowH - pad);
+
+    UIButton *del = [self keyWithTitle:@"⌫" action:@selector(backspaceTapped) flex:1];
+    del.frame = CGRectMake(CGRectGetMaxX(space.frame) + pad, y, funcW, rowH - pad);
+
+    UIButton *ret = [self keyWithTitle:@"换行" action:@selector(enterTapped) flex:1];
+    ret.frame = CGRectMake(CGRectGetMaxX(del.frame) + pad, y, funcW, rowH - pad);
+    ret.backgroundColor = [UIColor colorWithRed:0.0 green:0.48 blue:1.0 alpha:1.0];
+
+    // 收起键盘按钮（候选行右侧）
+    UIButton *hide = [UIButton buttonWithType:UIButtonTypeCustom];
+    [hide setTitle:@"收起" forState:UIControlStateNormal];
+    [hide setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    hide.titleLabel.font = [UIFont systemFontOfSize:15];
+    hide.backgroundColor = [UIColor colorWithWhite:0.3 alpha:1.0];
+    hide.layer.cornerRadius = 4;
+    hide.layer.masksToBounds = YES;
+    hide.frame = CGRectMake(W - pad - 78, pad, 78, topH - pad * 2);
+    [hide addTarget:self action:@selector(hideTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:hide];
+}
+
+- (void)buildLetterRowsWithTop:(CGFloat)top rowH:(CGFloat)rowH pad:(CGFloat)pad W:(CGFloat)W {
+    [self.letterKeys removeAllObjects];
+    for (UIView *v in [self.subviews copy]) {
+        if (v.tag == 777 || v.tag == 778) [v removeFromSuperview];
     }
 
-    UIWindowScene *scene = S3FixActiveScene();
-    if (!scene) {
-        S3FixLog(@"fallback aborted: no UIWindowScene");
+    NSArray *rows = @[kRow1, kRow2, kRow3];
+    for (NSInteger r = 0; r < rows.count; r++) {
+        NSString *row = rows[r];
+        NSInteger n = row.length;
+        CGFloat inset = r * 16.0;                     // 二、三行缩进
+        CGFloat availW = W - pad * 2 - inset;
+        CGFloat kw = (availW - pad * (n - 1)) / n;
+        CGFloat y = top + rowH * r;
+
+        for (NSInteger i = 0; i < n; i++) {
+            NSString *ch = [row substringWithRange:NSMakeRange(i, 1)];
+            UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+            b.tag = 777;
+            b.titleLabel.font = [UIFont systemFontOfSize:20 weight:UIFontWeightRegular];
+            [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            b.backgroundColor = [UIColor colorWithWhite:0.42 alpha:1.0];
+            b.layer.cornerRadius = 5.0;
+            b.layer.masksToBounds = YES;
+            b.frame = CGRectMake(pad + inset + i * (kw + pad), y, kw, rowH - pad);
+            [b addTarget:self action:@selector(letterTapped:) forControlEvents:UIControlEventTouchUpInside];
+            [self addSubview:b];
+            [self.letterKeys addObject:b];
+        }
+    }
+
+    [self refreshKeyTitles];
+}
+
+- (void)refreshKeyTitles {
+    NSArray *rows = @[kRow1, kRow2, kRow3];
+    NSInteger idx = 0;
+    for (NSString *row in rows) {
+        for (NSInteger i = 0; i < (NSInteger)row.length; i++) {
+            if (idx >= (NSInteger)self.letterKeys.count) break;
+            NSString *ch = [row substringWithRange:NSMakeRange(i, 1)];
+            if (!self.shifted) ch = [ch lowercaseString];
+            [self.letterKeys[idx] setTitle:ch forState:UIControlStateNormal];
+            idx++;
+        }
+    }
+}
+
+#pragma mark 键盘事件
+
+- (void)letterTapped:(UIButton *)sender {
+    NSString *ch = [sender titleForState:UIControlStateNormal];
+    [self commitChar:ch];
+    if (self.shifted) { self.shifted = NO; [self refreshKeyTitles]; }
+}
+
+- (void)shiftTapped {
+    self.shifted = !self.shifted;
+    [self refreshKeyTitles];
+}
+
+- (void)spaceTapped {
+    [self commitChar:@" "];
+}
+
+- (void)enterTapped {
+    [self commitChar:@"\n"];
+}
+
+- (void)backspaceTapped {
+    UIView *f = self.target;
+    if (!f) return;
+    NSString *t = S3FixTextOf(f);
+    if (t.length == 0) return;
+    NSRange last = [t rangeOfComposedCharacterSequenceAtIndex:t.length - 1];
+    t = [t stringByReplacingCharactersInRange:last withString:@""];
+    S3FixSetText(f, t);
+}
+
+- (void)numTapped {
+    self.numeric = !self.numeric;
+    [self rebuildForMode];
+}
+
+- (void)rebuildForMode {
+    for (UIView *v in [self.subviews copy]) {
+        if (v.tag == 777 || v.tag == 778) [v removeFromSuperview];
+    }
+    [self.letterKeys removeAllObjects];
+
+    if (!self.numeric) {
+        // 回到字母布局
+        CGFloat W = self.bounds.size.width;
+        CGFloat pad = 3.0, topH = 34.0;
+        CGFloat rowH = (self.bounds.size.height - topH - pad * 5) / 4.0;
+        [self buildLetterRowsWithTop:pad + topH rowH:rowH pad:pad W:W];
+        self.candidateLabel.text = @"  英文直接输入，⇧ 切换大小写";
         return;
     }
 
-    CGRect screen = [UIScreen mainScreen].bounds;
-    UIWindow *win;
-    if ([UIWindow instancesRespondToSelector:@selector(initWithWindowScene:)]) {
-        win = [[UIWindow alloc] initWithWindowScene:scene];
-        win.frame = CGRectMake(0, CGRectGetMaxY(screen) - 6, 4, 4);
-    } else {
-        win = [[UIWindow alloc] initWithFrame:CGRectMake(0, CGRectGetMaxY(screen) - 6, 4, 4)];
+    // 数字 / 符号布局
+    CGFloat W = self.bounds.size.width;
+    CGFloat pad = 3.0, topH = 34.0;
+    CGFloat rowH = (self.bounds.size.height - topH - pad * 5) / 4.0;
+    NSArray *numRows = @[@"1234567890", @"-/:;()$&@\"", @".?!'"];
+    for (NSInteger r = 0; r < numRows.count; r++) {
+        NSString *row = numRows[r];
+        NSInteger n = row.length;
+        CGFloat kw = (W - pad * 2 - pad * (n - 1)) / n;
+        CGFloat y = pad + topH + rowH * r;
+        for (NSInteger i = 0; i < n; i++) {
+            NSString *ch = [row substringWithRange:NSMakeRange(i, 1)];
+            UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+            b.tag = 777;
+            b.titleLabel.font = [UIFont systemFontOfSize:20];
+            [b setTitle:ch forState:UIControlStateNormal];
+            [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            b.backgroundColor = [UIColor colorWithWhite:0.42 alpha:1.0];
+            b.layer.cornerRadius = 5; b.layer.masksToBounds = YES;
+            b.frame = CGRectMake(pad + i * (kw + pad), y, kw, rowH - pad);
+            [b addTarget:self action:@selector(letterTapped:) forControlEvents:UIControlEventTouchUpInside];
+            [self addSubview:b];
+        }
     }
-    win.backgroundColor = [UIColor clearColor];
-    win.windowLevel = (S3FixBaseLevel > 0 ? S3FixBaseLevel : UIWindowLevelNormal) + 1;
+    self.candidateLabel.text = @"  数字 / 符号（再点 123 返回字母）";
+}
 
-    UIViewController *holder = [[UIViewController alloc] init];
-    holder.view.backgroundColor = [UIColor clearColor];
-    holder.view.frame = CGRectMake(0, 0, 4, 4);
+- (void)commitChar:(NSString *)ch {
+    UIView *f = self.target;
+    if (!f) return;
+    NSString *t = S3FixTextOf(f);
+    t = [t stringByAppendingString:ch];
+    S3FixSetText(f, t);
+}
 
-    UITextView *field = [[UITextView alloc] initWithFrame:CGRectMake(0, 0, 4, 4)];
-    field.text = initialText;
-    field.font = initialFont;
-    field.textColor = [UIColor clearColor];
-    field.backgroundColor = [UIColor clearColor];
-    field.autocorrectionType = UITextAutocorrectionTypeNo;
-    field.spellCheckingType = UITextSpellCheckingTypeNo;
-    [holder.view addSubview:field];
+- (void)hideTapped {
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"S3FixHideKeyboard" object:nil];
+}
 
-    win.rootViewController = holder;
-    win.hidden = NO;
-    [win makeKeyAndVisible];
+@end
 
-    if (!S3FixSink) S3FixSink = [[S3FixInputSink alloc] init];
-    S3FixSink.target = realField;
-    field.delegate = S3FixSink;
+#pragma mark - 键盘宿主 window
 
-    S3FixHelperWindow = win;
-    S3FixHelperField = field;
-    S3FixRealField = realField;
-    S3FixFallbackActive = YES;
+static void S3FixShowKeyboardFor(UIViewController *vc) {
+    UIView *field = S3FixFindTextField(vc.view);
+    if (!field) {
+        S3FixLog(@"no editable field found");
+        return;
+    }
 
-    S3FixLog(@"fallback started (level=%.0f)", win.windowLevel);
+    UIWindow *annoWin = S3FixWindowForView(vc.view);
+    CGFloat base = annoWin ? annoWin.windowLevel : (S3FixBaseLevel > 0 ? S3FixBaseLevel : UIWindowLevelStatusBar + 1);
+    S3FixBaseLevel = base;
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        BOOL ok = [field becomeFirstResponder];
-        S3FixLog(@"fallback becomeFirstResponder -> %d", ok);
-        S3FixRaiseKeyboardWindow(win.windowLevel + 1);
-    });
+    CGRect screen = [UIScreen mainScreen].bounds;
+    CGFloat kbH = 300.0;      // 键盘高度（含候选行）
+    if (screen.size.height < 600) kbH = 240.0;
 
-    // 文字编辑页被关掉后清理兜底窗口，并把 key 还给标注窗口
-    __weak UIViewController *weakVC = vc;
-    S3FixWatchTimer = [NSTimer scheduledTimerWithTimeInterval:0.6
-                                                     repeats:YES
-                                                       block:^(NSTimer *timer) {
-        UIViewController *strong = weakVC;
-        BOOL gone = (strong == nil) || (strong.view.window == nil) || strong.isBeingDismissed;
-        if (!gone) return;
-        [timer invalidate];
-        S3FixWatchTimer = nil;
-        S3FixStopFallback();
-        S3FixKeyboardDidShow = NO;
-    }];
+    // 复用已有 window，避免反复创建
+    if (!S3FixKbWindow || !S3FixKbView) {
+        UIWindow *w = [[UIWindow alloc] initWithFrame:CGRectMake(0, CGRectGetMaxY(screen) - kbH,
+                                                                 screen.size.width, kbH)];
+        // 用 initWithWindowScene: 让窗口能正常绘制（SpringBoard 下只有 SystemAperture scene，
+        // 但这只是"显示"用途，不涉及键盘服务，所以不受影响）
+        UIWindowScene *scene = nil;
+        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]]) { scene = (UIWindowScene *)s; break; }
+        }
+        if (scene && [UIWindow instancesRespondToSelector:@selector(initWithWindowScene:)]) {
+            w = [[UIWindow alloc] initWithWindowScene:scene];
+            w.frame = CGRectMake(0, CGRectGetMaxY(screen) - kbH, screen.size.width, kbH);
+        }
+
+        w.windowLevel = base + 2;          // 高于标注窗口
+        w.backgroundColor = [UIColor colorWithWhite:0.13 alpha:1.0];
+        w.hidden = NO;
+
+        S3FixKeyboardView_i *kv = [[S3FixKeyboardView_i alloc] initWithFrame:w.bounds];
+        kv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [w addSubview:kv];
+
+        S3FixKbWindow = w;
+        S3FixKbView = kv;
+    } else {
+        S3FixKbWindow.windowLevel = base + 2;
+        S3FixKbWindow.frame = CGRectMake(0, CGRectGetMaxY(screen) - kbH, screen.size.width, kbH);
+        S3FixKbView.frame = S3FixKbWindow.bounds;
+    }
+
+    S3FixTargetField = field;
+    S3FixKbView.target = field;
+    S3FixOwnerVC = vc;
+
+    S3FixKbWindow.hidden = NO;
+
+    // 不要 makeKey —— 标注窗口必须保持 key，否则它的触摸会失效
+    S3FixLog(@"keyboard shown for field: %@ (kb win level %.0f)", field, S3FixKbWindow.windowLevel);
+
+    // 让插件的输入框成为第一响应者：光标会出现，插件自己的「确认」逻辑也认为在编辑中。
+    // 因为该 input 所在的 window 属于 SystemAperture 场景，系统不会真的弹出键盘，
+    // 所以我们自己画的键盘就是唯一的输入来源。
+    if ([field respondsToSelector:@selector(becomeFirstResponder)]) {
+        [field becomeFirstResponder];
+    }
+}
+
+static void S3FixHideKeyboard(void) {
+    if (S3FixKbWindow) {
+        S3FixKbWindow.hidden = YES;
+    }
+    S3FixTargetField = nil;
+    if (S3FixKbView) S3FixKbView.target = nil;
+    S3FixOwnerVC = nil;
+    S3FixLog(@"keyboard hidden");
 }
 
 #pragma mark - 主修复
 
 static void S3FixEnsureKeyboard(id self, SEL _cmd) {
-    // 先跑原实现，保证原有行为不被破坏
+    // 原实现只做了不可靠的 makeKeyWindow + becomeFirstResponder，这里仍调用它，
+    // 以免破坏插件对 isKeyboardVisible 等内部状态的假设。
     if (S3FixOrigEnsure) S3FixOrigEnsure(self, _cmd);
 
     if (![self isKindOfClass:[UIViewController class]]) return;
     UIViewController *vc = (UIViewController *)self;
 
-    UIView *view = vc.view;
-    UIWindow *win = S3FixWindowForView(view);
+    UIView *win = S3FixWindowForView(vc.view);
+    S3FixLog(@"ensureTextKeyboard: vc=%@ win=%@ level=%.0f scene=%@",
+             vc, win, ((UIWindow *)win).windowLevel, ((UIWindow *)win).windowScene);
 
-    S3FixLog(@"ensureTextKeyboard: vc=%@ view=%@ win=%@", vc, view, win);
-
-    if (!win) {
-        S3FixLog(@"no window, abort");
-        return;
-    }
-
-    S3FixBaseLevel = win.windowLevel;
-
-    // 兜底已启用时不要再抢 key，否则会把键盘收回去
-    if (S3FixFallbackActive) {
-        S3FixLog(@"fallback active, skip key change");
-        S3FixTryBecomeFirstResponder(vc);
-        return;
-    }
-
-    // a. 补绑 windowScene：没有 scene 的 window 在 iOS 13+ 上无法承载键盘
-    if ([win respondsToSelector:@selector(windowScene)] && !win.windowScene) {
-        UIWindowScene *scene = S3FixActiveScene();
-        S3FixLog(@"window has no scene, try bind: %@", scene);
-        if (scene) {
-            SEL sel = NSSelectorFromString(@"_setWindowScene:");
-            if ([win respondsToSelector:sel]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                [win performSelector:sel withObject:scene];
-#pragma clang diagnostic pop
-            } else {
-                @try {
-                    [win setValue:scene forKey:@"windowScene"];
-                } @catch (NSException *e) {
-                    S3FixLog(@"KVC windowScene failed: %@", e);
-                }
-            }
-            S3FixLog(@"window scene now: %@", win.windowScene);
-        }
-    }
-
-    // b. 可见 + key
-    if (win.hidden) {
-        win.hidden = NO;
-        S3FixLog(@"window was hidden -> NO");
-    }
-    [win makeKeyAndVisible];
-    S3FixLog(@"after makeKeyAndVisible: isKey=%d level=%.0f scene=%@",
-             win.isKeyWindow, win.windowLevel, win.windowScene);
-
-    // c. 多次重试成为第一响应者
-    S3FixTryBecomeFirstResponder(vc);
-    for (NSNumber *num in @[@0.15, @0.4, @0.9]) {
-        NSTimeInterval delay = [num doubleValue];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (S3FixFallbackActive) return;
-            if (![win isKeyWindow]) [win makeKeyAndVisible];
-            S3FixTryBecomeFirstResponder(vc);
-            S3FixRaiseKeyboardWindow(win.windowLevel + 1);
-        });
-    }
-
-    // d. 键盘弹出后把键盘窗口抬到标注窗口之上
+    // 延后一点，等插件的 panel 完全布局完（键盘要贴在 panel 下方，不能盖住它）
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        S3FixRaiseKeyboardWindow(win.windowLevel + 1);
+        S3FixShowKeyboardFor(vc);
     });
-
-    // e. 2.5s 后仍没键盘 -> 启用兜底输入窗口
-    S3FixKeyboardDidShow = NO;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (S3FixKeyboardDidShow || S3FixFallbackActive) return;
-        UIViewController *strong = vc;
-        if (!strong || strong.view.window == nil) return;
-        S3FixLog(@"keyboard never showed, start fallback");
-        S3FixStartFallback(strong);
-    });
-}
-
-#pragma mark - 键盘通知（诊断 + 提级）
-
-static void S3FixRegisterKeyboardObservers(void) {
-    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-    [nc addObserverForName:UIKeyboardWillShowNotification
-                    object:nil
-                     queue:[NSOperationQueue mainQueue]
-                usingBlock:^(NSNotification *note) {
-        S3FixKeyboardDidShow = YES;
-        S3FixLog(@"UIKeyboardWillShow");
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            CGFloat base = S3FixBaseLevel > 0 ? S3FixBaseLevel : UIWindowLevelNormal;
-            S3FixRaiseKeyboardWindow(base + 1);
-        });
-    }];
-    [nc addObserverForName:UIKeyboardDidShowNotification
-                    object:nil
-                     queue:[NSOperationQueue mainQueue]
-                usingBlock:^(NSNotification *note) {
-        S3FixKeyboardDidShow = YES;
-    }];
 }
 
 #pragma mark - 安装
@@ -384,21 +490,13 @@ static void S3FixRegisterKeyboardObservers(void) {
 static BOOL S3FixInstall(void) {
     Class cls = NSClassFromString(@"S3TextEditViewController");
     if (!cls) return NO;
-
     SEL sel = NSSelectorFromString(@"ensureTextKeyboard");
     Method m = class_getInstanceMethod(cls, sel);
-    if (!m) {
-        S3FixLog(@"S3TextEditViewController found but ensureTextKeyboard missing");
-        return NO;
-    }
+    if (!m) { S3FixLog(@"class found but selector missing"); return NO; }
 
-    IMP orig = method_getImplementation(m);
-    S3FixOrigEnsure = (void (*)(id, SEL))orig;
-
+    S3FixOrigEnsure = (void (*)(id, SEL))method_getImplementation(m);
     method_setImplementation(m, imp_implementationWithBlock(^(id self) {
-        @autoreleasepool {
-            S3FixEnsureKeyboard(self, sel);
-        }
+        @autoreleasepool { S3FixEnsureKeyboard(self, sel); }
     }));
 
     S3FixLog(@"hook installed on S3TextEditViewController");
@@ -409,31 +507,47 @@ static void S3FixPoll(void) {
     if (S3FixInstalled) return;
     if (S3FixInstall()) {
         S3FixInstalled = YES;
-        S3FixRegisterKeyboardObservers();
+
+        // 收起键盘
+        [[NSNotificationCenter defaultCenter] addObserverForName:@"S3FixHideKeyboard"
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification *n) {
+            S3FixHideKeyboard();
+        }];
+
+        // 文字编辑页消失后自动收起键盘
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardWillShowNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification *n) {
+            // 系统键盘如果真的出来了（未来系统版本修复了），就不要我们自己的了
+            S3FixLog(@"system keyboard will show");
+        }];
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        S3FixPoll();
-    });
+                   dispatch_get_main_queue(), ^{ S3FixPoll(); });
+}
+
+static void S3FixTidyTimer(void) {
+    // 标注 VC 消失 -> 收起自绘键盘
+    if (!S3FixOwnerVC) return;
+    if (S3FixOwnerVC.view.window == nil || S3FixOwnerVC.isBeingDismissed) {
+        S3FixHideKeyboard();
+    }
 }
 
 __attribute__((constructor))
 static void S3FixInit(void) {
     @autoreleasepool {
-        S3FixLog(@"----- S3TextKeyboardFix loaded (pid=%d) -----", getpid());
+        S3FixLog(@"----- S3TextKeyboardFix v2 (custom keyboard) loaded (pid=%d) -----", getpid());
 
-        dispatch_async(dispatch_get_main_queue(), ^{
-            S3FixPoll();
-        });
+        dispatch_async(dispatch_get_main_queue(), ^{ S3FixPoll(); });
 
-        [[NSNotificationCenter defaultCenter]
-         addObserverForName:UIApplicationDidFinishLaunchingNotification
-                     object:nil
-                      queue:[NSOperationQueue mainQueue]
-                 usingBlock:^(NSNotification *note) {
-            S3FixLog(@"app finished launching, install hook");
-            S3FixPoll();
+        NSTimer *t = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *tt) {
+            S3FixTidyTimer();
         }];
+        (void)t;
     }
 }
